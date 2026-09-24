@@ -133,6 +133,29 @@ end
 -- Apre ButtonDialog con elenco font; ConfigDialog resta aperto sotto.
 -- Header fisso: |Fonts              Close| (fuori dallo scroll).
 -- Tap font = onSetFont immediato.
+-- Ogni riga mostra il nome del font renderizzato con se stesso (anteprima).
+
+-- Font:getFace: se riceve già una FontFaceObj:
+--   - stessa size (o nil) → pass-through (niente lookup/scaling, face_index intatto)
+--   - size diversa → ricrea (caso troncamento Button: new_size -= 1)
+if not Font._fonts_menu_getface_patch then
+    local raw_getFace = Font.getFace
+    function Font:getFace(font, size, faceindex)
+        if type(font) == "table" and font.ftsize then
+            if not size or size == font.orig_size then
+                return font
+            end
+            if faceindex == nil then
+                local fi = font.hash and font.hash:match("/(%d+)$")
+                if fi then faceindex = tonumber(fi) end
+            end
+            return raw_getFace(self, font.orig_font, size, faceindex)
+        end
+        return raw_getFace(self, font, size, faceindex)
+    end
+    Font._fonts_menu_getface_patch = true
+    logger.info("fonts-menu-patch: Font:getFace patchato (FontFaceObj pass-through)")
+end
 
 -- Header fisso in alto: "Fonts" a sinistra, "Close" a destra (inglese).
 -- Va reinserito dopo ogni reinit() del ButtonDialog.
@@ -188,38 +211,97 @@ if not ReaderFont.onShowFontFaceMenu then
         -- Deferred: lascia finire onConfigChoose (update + repaint del
         -- ConfigDialog) prima di sovrapporre la modale.
         UIManager:nextTick(function()
-            -- Stessa sorgente del menù esistente
-            if not self.face_table or self.face_table.needs_refresh then
+            -- Se face_table esiste, NON rifare setupFaceMenuTable:
+            -- con "sort by recently selected" rimetterebbe il font
+            -- scelto in testa. needs_refresh viene ignorato di proposito
+            -- per tenere l'ordine stabile.
+            if not self.face_table then
                 self:setupFaceMenuTable()
             end
 
             local dialog
             local buttons = {}
 
-            -- face_table: [1]=Font settings, [2]=Font-family fonts, poi i font
+            -- Ordine stabile: cattura l'ordine (id) la prima volta;
+            -- riusa sempre quello, anche se face_table viene riordinata.
+            if not self._fonts_menu_order then
+                self._fonts_menu_order = {}
+                for i = 3, #self.face_table do
+                    local item = self.face_table[i]
+                    if item.menu_item_id then
+                        table.insert(self._fonts_menu_order, item.menu_item_id)
+                    end
+                end
+            end
+            local ordered_items = {}
+            local by_id = {}
             for i = 3, #self.face_table do
                 local item = self.face_table[i]
                 if item.menu_item_id then
-                    local text = item.text_func and item.text_func() or item.text
-                    table.insert(buttons, {{
-                        text = text,
-                        checked_func = item.checked_func, -- ✓ sul font corrente
-                        callback = function()
-                            if item.callback then
-                                item.callback() -- onSetFont + recently selected
-                            end
-                            -- Aggiorna marcatore + riusa header fisso
-                            if dialog then
-                                dialog:reinit()
-                                applyFontsHeader(dialog)
-                                UIManager:setDirty(dialog, "ui")
-                            end
-                        end,
-                        hold_callback = item.hold_callback and function()
-                            item.hold_callback(nil) -- makeDefault (senza TouchMenu)
-                        end or nil,
-                    }})
+                    by_id[item.menu_item_id] = item
                 end
+            end
+            local seen = {}
+            for _, id in ipairs(self._fonts_menu_order) do
+                if by_id[id] then
+                    table.insert(ordered_items, by_id[id])
+                    seen[id] = true
+                end
+            end
+            -- Font nuovi (non in snapshot) → in coda
+            for i = 3, #self.face_table do
+                local item = self.face_table[i]
+                if item.menu_item_id and not seen[item.menu_item_id] then
+                    table.insert(ordered_items, item)
+                end
+            end
+
+            -- Anteprima: stessa size del menù TouchMenu; altezza fissa
+            -- così righe con metriche diverse restano uniformi.
+            local PREVIEW_SIZE = 20
+            local ref_probe = TextWidget:new{
+                text = "Ag",
+                face = Font:getFace("infofont", PREVIEW_SIZE),
+            }
+            local row_height = ref_probe:getSize().h
+            ref_probe:free()
+
+            for _, item in ipairs(ordered_items) do
+                local text = item.text_func and item.text_func() or item.text
+                -- FontFaceObj del documento (nil se opzione disattivata
+                -- o font non risolvibile → fallback font UI di default)
+                local preview_face = nil
+                if item.font_func then
+                    preview_face = item.font_func(PREVIEW_SIZE)
+                end
+                table.insert(buttons, {{
+                    text = text,
+                    font_face = preview_face, -- FontFaceObj o nil
+                    font_size = PREVIEW_SIZE, -- usato solo se face == nil
+                    font_bold = false,        -- anteprima fedele, non bold
+                    height = row_height,      -- righe allineate
+                    align = "left",
+                    avoid_text_truncation = false, -- niente loop resize su nomi lunghi
+                    checked_func = item.checked_func, -- ✓ sul font corrente
+                    callback = function()
+                        if item.callback then
+                            item.callback() -- onSetFont + recently selected
+                        end
+                        -- Aggiorna ✓ ma MANTIENI lo scroll dove stava
+                        if dialog then
+                            local offset = dialog:getScrolledOffset()
+                            dialog:reinit()
+                            applyFontsHeader(dialog)
+                            if offset then
+                                dialog:setScrolledOffset(offset)
+                            end
+                            UIManager:setDirty(dialog, "ui")
+                        end
+                    end,
+                    hold_callback = item.hold_callback and function()
+                        item.hold_callback(nil) -- makeDefault (senza TouchMenu)
+                    end or nil,
+                }})
             end
 
             dialog = ButtonDialog:new{

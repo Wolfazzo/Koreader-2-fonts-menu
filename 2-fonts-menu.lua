@@ -1,7 +1,8 @@
--- Patch: scorciatoia "Aa" nel menù in basso (ConfigDialog)
--- Nella scheda "Dimensione font" (pannello appbar.textsize) compare la
--- scorciatoia "Aa" subito sotto la riga "Dimensione Font / diminuisci / aumenta":
--- un tap apre direttamente il pannello di scelta dei font già presente in app.
+-- Patch: scorciatoia "SHOW FONTS" nel ConfigDialog (pannello Dimensione font)
+-- Un tap su "SHOW FONTS" apre una modale ButtonDialog con l'elenco dei font
+-- (stessa sorgente del menù: face_table / cre.getFontFaces).
+-- Il ConfigDialog resta aperto sotto la modale.
+-- Tap su un font → applica subito; "Close" → chiude solo la modale.
 -- Solo documenti CRE (EPUB/TXT/...): i PDF usano KoptOptions e non
 -- vengono toccati.
 
@@ -9,10 +10,17 @@ local CreOptions = require("ui/data/creoptions")
 local ReaderFont = require("apps/reader/modules/readerfont")
 local UIManager = require("ui/uimanager")
 local ConfigDialog = require("ui/widget/configdialog")
+local ButtonDialog = require("ui/widget/buttondialog")
+local Button = require("ui/widget/button")
+local OverlapGroup = require("ui/widget/overlapgroup")
+local TextWidget = require("ui/widget/textwidget")
+local Font = require("ui/font")
+local Geom = require("ui/geometry")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Size = require("ui/size")
 local logger = require("logger")
+local _ = require("gettext")
 
 local SHORTCUT_NAME = "font_face_shortcut"
 
@@ -120,83 +128,114 @@ if not ConfigDialog._fonts_menu_patch then
     logger.info("fonts-menu-patch: hook ConfigDialog:update installato (Aa left-align)")
 end
 
--- ─── 2. Apertura diretta della lista font dal ConfigDialog ─────────────────
--- Evento "ShowFontFaceMenu" spedito da ConfigDialog:onConfigEvent
--- → propagato a ReaderUI → ReaderFont:onShowFontFaceMenu
+-- ─── 2. Modale font sopra il ConfigDialog ──────────────────────────────────
+-- Evento "ShowFontFaceMenu" → ReaderFont:onShowFontFaceMenu
+-- Apre ButtonDialog con elenco font; ConfigDialog resta aperto sotto.
+-- Header fisso: |Fonts              Close| (fuori dallo scroll).
+-- Tap font = onSetFont immediato.
 
-local function findTypesetTabIndex(menu)
-    if menu.tab_item_table == nil then
-        menu:setUpdateItemTable()
+-- Header fisso in alto: "Fonts" a sinistra, "Close" a destra (inglese).
+-- Va reinserito dopo ogni reinit() del ButtonDialog.
+local function applyFontsHeader(dialog)
+    if not dialog or not dialog.title_group or not dialog.title_group_width then
+        return
     end
-    local tabs = menu.tab_item_table
-    if not tabs then return 2 end
-    for i, tab in ipairs(tabs) do
-        if tab.id == "typeset" or tab.icon == "appbar.typeset" then
-            return i
-        end
-    end
-    return 2 -- fallback: typeset è di default la seconda tab
-end
+    local width = dialog.title_group_width
 
-local function selectChangeFontItem(menu)
-    local container = menu.menu_container
-    if not (container and container[1]) then return end
-    local touch_menu = container[1]
-    local item_table = touch_menu.item_table
-    if not item_table then return end
-    for _, item in ipairs(item_table) do
-        if item.id == "change_font" then
-            -- FIX 1: verifica che onMenuSelect esista prima di chiamarlo
-            if type(touch_menu.onMenuSelect) == "function" then
-                touch_menu:onMenuSelect(item)
+    local fonts_label = TextWidget:new{
+        text = "Fonts",
+        face = Font:getFace("infofont"),
+    }
+    local close_btn = Button:new{
+        text = "Close", -- solo testo inglese, non tradotto
+        bordersize = 0,
+        margin = 0,
+        padding = Size.padding.buttontable,
+        padding_h = Size.padding.button,
+        text_font_face = "infofont",
+        text_font_size = 20,
+        text_font_bold = false,
+        show_parent = dialog,
+        callback = function()
+            if dialog.movable then
+                dialog.movable:resetEventState()
             end
-            return true
-        end
+            UIManager:close(dialog)
+        end,
+    }
+    close_btn.overlap_align = "right"
+
+    local h = math.max(fonts_label:getSize().h, close_btn:getSize().h)
+    local header = OverlapGroup:new{
+        dimen = Geom:new{ w = width, h = h },
+        fonts_label,  -- default: left
+        close_btn,    -- overlap_align = right
+    }
+
+    local content = dialog.title_group[1] -- VerticalGroup del titolo
+    if not content then return end
+    for i = #content, 1, -1 do
+        content[i] = nil
     end
-    logger.warn("fonts-menu-patch: item change_font non trovato nel tab typeset")
-    return false
+    table.insert(content, header)
+    if content.resetLayout then
+        content:resetLayout()
+    end
 end
 
 if not ReaderFont.onShowFontFaceMenu then
     function ReaderFont:onShowFontFaceMenu()
-        -- Tutto deferred: lascia finire onConfigChoose (update + repaint
-        -- del ConfigDialog) prima di chiudere/sovrapporre il menù principale
+        -- Deferred: lascia finire onConfigChoose (update + repaint del
+        -- ConfigDialog) prima di sovrapporre la modale.
         UIManager:nextTick(function()
-            -- 1. Chiudi il ConfigDialog, se ancora aperto
-            local config = self.ui and self.ui.config
-            if config and config.config_dialog then
-                -- FIX 2: verifica che closeDialog esista come funzione
-                if type(config.config_dialog.closeDialog) == "function" then
-                    config.config_dialog:closeDialog()
-                end
-            end
-
-            local menu = self.ui and self.ui.menu
-            if not menu or not menu.onShowMenu then return end
-
-            -- Garantisci che face_table esista (di solito già costruita
-            -- da setupFaceMenuTable in onReadSettings)
-            if not self.face_table then
+            -- Stessa sorgente del menù esistente
+            if not self.face_table or self.face_table.needs_refresh then
                 self:setupFaceMenuTable()
             end
 
-            -- Chiudi un eventuale menù principale già aperto
-            if menu.menu_container and menu.onCloseReaderMenu then
-                menu:onCloseReaderMenu()
+            local dialog
+            local buttons = {}
+
+            -- face_table: [1]=Font settings, [2]=Font-family fonts, poi i font
+            for i = 3, #self.face_table do
+                local item = self.face_table[i]
+                if item.menu_item_id then
+                    local text = item.text_func and item.text_func() or item.text
+                    table.insert(buttons, {{
+                        text = text,
+                        checked_func = item.checked_func, -- ✓ sul font corrente
+                        callback = function()
+                            if item.callback then
+                                item.callback() -- onSetFont + recently selected
+                            end
+                            -- Aggiorna marcatore + riusa header fisso
+                            if dialog then
+                                dialog:reinit()
+                                applyFontsHeader(dialog)
+                                UIManager:setDirty(dialog, "ui")
+                            end
+                        end,
+                        hold_callback = item.hold_callback and function()
+                            item.hold_callback(nil) -- makeDefault (senza TouchMenu)
+                        end or nil,
+                    }})
+                end
             end
 
-            local tab_index = findTypesetTabIndex(menu)
-            menu:onShowMenu(tab_index)
-
-            -- 2. Dopo che il TouchMenu è mostrato, apri change_font
-            UIManager:nextTick(function()
-                selectChangeFontItem(menu)
-            end)
+            dialog = ButtonDialog:new{
+                title = "Fonts", -- placeholder: sostituito da applyFontsHeader
+                buttons = buttons, -- solo font + scroll; Close è nell'header
+                rows_per_page = 6,
+                width_factor = 0.8,
+                dismissable = true, -- tap fuori chiude solo il modale
+            }
+            applyFontsHeader(dialog)
+            UIManager:show(dialog)
         end)
 
         return true -- evento consumato
     end
-    logger.info("fonts-menu-patch: ReaderFont:onShowFontFaceMenu installato")
+    logger.info("fonts-menu-patch: ReaderFont:onShowFontFaceMenu installato (modale)")
 else
     logger.info("fonts-menu-patch: onShowFontFaceMenu già presente, patch saltata")
 end

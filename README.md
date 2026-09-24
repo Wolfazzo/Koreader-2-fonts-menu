@@ -1,5 +1,5 @@
 # Koreader-2-fonts-menu
-Fotns menù link in the character panel
+Fonts menù link in the character panel
 
 
 Copy 2-fonts-menu.lua in koreader/patches/

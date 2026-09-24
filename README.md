@@ -11,5 +11,6 @@ Testing on Kindle pw 11 gen and koreader on linux
 
 <img width="619" height="798" alt="show1" src="https://github.com/user-attachments/assets/913c5bb3-e718-409b-8e1b-eca17c9c2fd8" />
 
-<img width="619" height="796" alt="modale" src="https://github.com/user-attachments/assets/47d0ddd5-f0d2-4cd7-8db5-cbf72e67e310" />
+<img width="622" height="797" alt="Fonts preview" src="https://github.com/user-attachments/assets/11384948-3f66-4f45-85f9-c85aa19528b8" />
+
 

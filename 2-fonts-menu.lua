@@ -20,14 +20,14 @@ local LeftContainer = require("ui/widget/container/leftcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Size = require("ui/size")
 local logger = require("logger")
-local _ = require("gettext")
 
 local SHORTCUT_NAME = "font_face_shortcut"
+local active_font_dialog = nil
 
 -- ─── 1. Iniezione opzione nel pannello Dimensione font (solo CreOptions) ───
--- "Aa" viene inserita come opzione separata subito dopo font_fine_tune
--- (la riga "diminuisci / aumenta"). NON si toccano le tabelle esistenti
--- di font_size per evitare di corrompere array condivisi.
+-- "SHOW FONTS" viene inserita come prima opzione del pannello
+-- (prima di font_size e font_fine_tune). NON si toccano le tabelle
+-- esistenti per evitare di corrompere array condivisi.
 
 local function injectShortcutOption()
     for _, panel in ipairs(CreOptions) do
@@ -39,26 +39,26 @@ local function injectShortcutOption()
                 end
             end
 
-            -- Posiziona Aa in prima posizione, sopra le dimensioni preimpostate.
+            -- Posiziona SHOW FONTS in prima posizione, sopra le dimensioni preimpostate.
             local insert_at = 1
 
             -- values omesso → niente ConfigChange, niente salvataggio in configurable.
             -- current_func restituisce sempre 0 = args[1]: ConfigDialog imposta
-            -- current_item = 1 ad ogni ridisegno → sottolineatura nera permanente su Aa.
+            -- current_item = 1 ad ogni ridisegno → sottolineatura nera permanente su SHOW FONTS.
             -- args = {0} è necessario sia per current_func sia per onMakeDefault.
             table.insert(panel.options, insert_at, {
                 name = SHORTCUT_NAME,
-                -- name_text omesso: solo le lettere Aa, senza etichetta a sinistra
+                -- name_text omesso: solo "SHOW FONTS", senza etichetta a sinistra
                 item_text = { "SHOW FONTS" },
                 item_align_center = 1.0,
                 item_font_size = 20,
-                height = 18, -- riga più stretta: meno spazio vuoto sopra/sotto Aa
+                height = 18, -- riga più stretta: meno spazio vuoto sopra/sotto SHOW FONTS
                 spacing = 15,
                 args = { 0 },
                 current_func = function() return 0 end, -- forza sottolineatura sempre visibile
                 event = "ShowFontFaceMenu",
             })
-            logger.info("fonts-menu-patch: scorciatoia Aa inserita prima di font_fine_tune (sottolineata)")
+            logger.info("fonts-menu-patch: scorciatoia SHOW FONTS inserita prima di font_size (sottolineata)")
             return true
         end
     end
@@ -68,8 +68,8 @@ end
 
 injectShortcutOption()
 
--- ─── 1b. Allineamento "Aa" al bordo sinistro del pannello ─────────────────
--- ConfigDialog usa CenterContainer per gli item → "Aa" finisce al centro.
+-- ─── 1b. Allineamento "SHOW FONTS" al bordo sinistro del pannello ─────────
+-- ConfigDialog usa CenterContainer per gli item → "SHOW FONTS" finisce al centro.
 -- Dopo ogni update() sostituiamo il container della riga con LeftContainer
 -- (stessa dimen → nessun resize, solo diverso paint).
 
@@ -125,7 +125,7 @@ if not ConfigDialog._fonts_menu_patch then
         end
     end
     ConfigDialog._fonts_menu_patch = true
-    logger.info("fonts-menu-patch: hook ConfigDialog:update installato (Aa left-align)")
+    logger.info("fonts-menu-patch: hook ConfigDialog:update installato (SHOW FONTS left-align)")
 end
 
 -- ─── 2. Modale font sopra il ConfigDialog ──────────────────────────────────
@@ -159,22 +159,49 @@ end
 
 -- Header fisso in alto: "Fonts" a sinistra, "Close" a destra (inglese).
 -- Va reinserito dopo ogni reinit() del ButtonDialog.
+-- Altezza = altezza del TextBoxWidget originale del titolo, così
+-- title_group_height / top_to_content_offset / max_height calcolati
+-- in ButtonDialog:init restano validi (nessun ricallcolo layout).
 local function applyFontsHeader(dialog)
     if not dialog or not dialog.title_group or not dialog.title_group_width then
         return
     end
     local width = dialog.title_group_width
 
+    local content = dialog.title_group[1] -- VerticalGroup del titolo
+    if not content then return end
+
+    -- Altezza originale del TextBoxWidget del titolo (prima di clear)
+    local target_h
+    if content[1] and content[1].getSize then
+        target_h = content[1]:getSize().h
+    end
+
     local fonts_label = TextWidget:new{
         text = "Fonts",
         face = Font:getFace("infofont"),
     }
+    local natural_h = fonts_label:getSize().h
+    local h = target_h or natural_h
+
+    -- Centra verticalmente "Fonts" se l'header è più alto del label;
+    -- LeftContainer allinea a sinistra (CenterContainer lo sposterebbe al centro)
+    local label_widget = fonts_label
+    if h > natural_h then
+        label_widget = LeftContainer:new{
+            dimen = Geom:new{ w = width, h = h },
+            fonts_label,
+        }
+    end
+
     local close_btn = Button:new{
         text = "Close", -- solo testo inglese, non tradotto
         bordersize = 0,
         margin = 0,
-        padding = Size.padding.buttontable,
+        padding = 0,
+        padding_v = 0, -- nessun padding verticale → altezza = height esatto
         padding_h = Size.padding.button,
+        height = h, -- altezza fissa = header (label_container = reference_height)
         text_font_face = "infofont",
         text_font_size = 20,
         text_font_bold = false,
@@ -183,27 +210,19 @@ local function applyFontsHeader(dialog)
             if dialog.movable then
                 dialog.movable:resetEventState()
             end
-            UIManager:close(dialog)
+            dialog:onClose() -- chiama tap_close_callback (se imposto) e UIManager:close
         end,
     }
     close_btn.overlap_align = "right"
 
-    local h = math.max(fonts_label:getSize().h, close_btn:getSize().h)
     local header = OverlapGroup:new{
         dimen = Geom:new{ w = width, h = h },
-        fonts_label,  -- default: left
+        label_widget, -- default: left
         close_btn,    -- overlap_align = right
     }
 
-    local content = dialog.title_group[1] -- VerticalGroup del titolo
-    if not content then return end
-    for i = #content, 1, -1 do
-        content[i] = nil
-    end
+    content:clear() -- free() + rimuove figli (niente leak)
     table.insert(content, header)
-    if content.resetLayout then
-        content:resetLayout()
-    end
 end
 
 if not ReaderFont.onShowFontFaceMenu then
@@ -211,6 +230,13 @@ if not ReaderFont.onShowFontFaceMenu then
         -- Deferred: lascia finire onConfigChoose (update + repaint del
         -- ConfigDialog) prima di sovrapporre la modale.
         UIManager:nextTick(function()
+            -- Single-instance: chiudi eventuale modale già aperta
+            if active_font_dialog then
+                local old = active_font_dialog
+                active_font_dialog = nil
+                old:onClose()
+            end
+
             -- Se face_table esiste, NON rifare setupFaceMenuTable:
             -- con "sort by recently selected" rimetterebbe il font
             -- scelto in testa. needs_refresh viene ignorato di proposito
@@ -258,12 +284,14 @@ if not ReaderFont.onShowFontFaceMenu then
 
             -- Anteprima: stessa size del menù TouchMenu; altezza fissa
             -- così righe con metriche diverse restano uniformi.
+            -- + Size.padding.default: margine verticale per font alti
+            -- (evita clipping di glyph con ascender/descender estremi).
             local PREVIEW_SIZE = 20
             local ref_probe = TextWidget:new{
                 text = "Ag",
                 face = Font:getFace("infofont", PREVIEW_SIZE),
             }
-            local row_height = ref_probe:getSize().h
+            local row_height = ref_probe:getSize().h + Size.padding.default
             ref_probe:free()
 
             for _, item in ipairs(ordered_items) do
@@ -311,6 +339,19 @@ if not ReaderFont.onShowFontFaceMenu then
                 width_factor = 0.8,
                 dismissable = true, -- tap fuori chiude solo il modale
             }
+            active_font_dialog = dialog
+            -- Pulizia single-instance su OGNI percorso di chiusura:
+            -- onClose, back key, tap fuori, UIManager:close(esterno).
+            -- UIManager:close invia sempre CloseWidget → onCloseWidget.
+            local raw_onCloseWidget = dialog.onCloseWidget
+            function dialog:onCloseWidget(...)
+                if active_font_dialog == dialog then
+                    active_font_dialog = nil
+                end
+                if raw_onCloseWidget then
+                    return raw_onCloseWidget(self, ...)
+                end
+            end
             applyFontsHeader(dialog)
             UIManager:show(dialog)
         end)

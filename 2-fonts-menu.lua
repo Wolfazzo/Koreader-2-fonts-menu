@@ -1,5 +1,5 @@
--- Patch: scorciatoia "SHOW FONTS" nel ConfigDialog (pannello Dimensione font)
--- Un tap su "SHOW FONTS" apre una modale ButtonDialog con l'elenco dei font
+-- Patch: scorciatoia "Font" nel ConfigDialog (pannello Dimensione font)
+-- Un tap sulla scorciatoia apre una modale ButtonDialog con l'elenco dei font
 -- (stessa sorgente del menù: face_table / cre.getFontFaces).
 -- Il ConfigDialog resta aperto sotto la modale.
 -- Tap su un font → applica subito; "Close" → chiude solo la modale.
@@ -20,16 +20,23 @@ local LeftContainer = require("ui/widget/container/leftcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Size = require("ui/size")
 local logger = require("logger")
+-- Traduzioni: la patch viene caricata con priorità "late" (reader.lua),
+-- quindi dopo che la lingua del dispositivo è già stata applicata a gettext.
+local _ = require("gettext")
 
 local SHORTCUT_NAME = "font_face_shortcut"
 local active_font_dialog = nil
 
 -- ─── 1. Iniezione opzione nel pannello Dimensione font (solo CreOptions) ───
--- "SHOW FONTS" viene inserita come prima opzione del pannello
+-- La scorciatoia "Font" viene inserita come prima opzione del pannello
 -- (prima di font_size e font_fine_tune). NON si toccano le tabelle
 -- esistenti per evitare di corrompere array condivisi.
 
 local function injectShortcutOption()
+    -- Traduzione calcolata FUORI dai loop: in `for _, ...` la variabile
+    -- locale `_` del loop oscura quella di gettext e `_(...)` esploderebbe
+    -- con "attempt to call local '_' (a number value)".
+    local shortcut_label = _("Font")
     for _, panel in ipairs(CreOptions) do
         if panel.icon == "appbar.textsize" and type(panel.options) == "table" then
             -- Guard: già iniettata?
@@ -39,26 +46,28 @@ local function injectShortcutOption()
                 end
             end
 
-            -- Posiziona SHOW FONTS in prima posizione, sopra le dimensioni preimpostate.
+            -- Posiziona la scorciatoia in prima posizione, sopra le dimensioni preimpostate.
             local insert_at = 1
 
             -- values omesso → niente ConfigChange, niente salvataggio in configurable.
             -- current_func restituisce sempre 0 = args[1]: ConfigDialog imposta
-            -- current_item = 1 ad ogni ridisegno → sottolineatura nera permanente su SHOW FONTS.
+            -- current_item = 1 ad ogni ridisegno → sottolineatura nera permanente sulla riga.
             -- args = {0} è necessario sia per current_func sia per onMakeDefault.
             table.insert(panel.options, insert_at, {
                 name = SHORTCUT_NAME,
-                -- name_text omesso: solo "SHOW FONTS", senza etichetta a sinistra
-                item_text = { "SHOW FONTS" },
+                -- name_text omesso: solo l'etichetta, senza label a sinistra.
+                -- shortcut_label = _("Font"), msgid già nei cataloghi KOReader
+                -- → tradotta in tutte le lingue (it "Carattere", fr "Police", ...).
+                item_text = { shortcut_label },
                 item_align_center = 1.0,
                 item_font_size = 20,
-                height = 18, -- riga più stretta: meno spazio vuoto sopra/sotto SHOW FONTS
+                height = 18, -- riga più stretta: meno spazio vuoto sopra/sotto la scorciatoia
                 spacing = 15,
                 args = { 0 },
                 current_func = function() return 0 end, -- forza sottolineatura sempre visibile
                 event = "ShowFontFaceMenu",
             })
-            logger.info("fonts-menu-patch: scorciatoia SHOW FONTS inserita prima di font_size (sottolineata)")
+            logger.info("fonts-menu-patch: scorciatoia font inserita prima di font_size (sottolineata)")
             return true
         end
     end
@@ -68,8 +77,8 @@ end
 
 injectShortcutOption()
 
--- ─── 1b. Allineamento "SHOW FONTS" al bordo sinistro del pannello ─────────
--- ConfigDialog usa CenterContainer per gli item → "SHOW FONTS" finisce al centro.
+-- ─── 1b. Allineamento scorciatoia al bordo sinistro del pannello ───────────
+-- ConfigDialog usa CenterContainer per gli item → la riga finisce al centro.
 -- Dopo ogni update() sostituiamo il container della riga con LeftContainer
 -- (stessa dimen → nessun resize, solo diverso paint).
 
@@ -125,13 +134,15 @@ if not ConfigDialog._fonts_menu_patch then
         end
     end
     ConfigDialog._fonts_menu_patch = true
-    logger.info("fonts-menu-patch: hook ConfigDialog:update installato (SHOW FONTS left-align)")
+    logger.info("fonts-menu-patch: hook ConfigDialog:update installato (scorciatoia left-align)")
 end
 
 -- ─── 2. Modale font sopra il ConfigDialog ──────────────────────────────────
 -- Evento "ShowFontFaceMenu" → ReaderFont:onShowFontFaceMenu
 -- Apre ButtonDialog con elenco font; ConfigDialog resta aperto sotto.
--- Header fisso: |Fonts              Close| (fuori dallo scroll).
+-- Header fisso: |Carattere            Close| (fuori dallo scroll).
+-- Stesso msgid della riga nel ConfigDialog: traduzioni corte, niente
+-- titoli lunghi che finiscono sotto il pulsante Close.
 -- Tap font = onSetFont immediato.
 -- Ogni riga mostra il nome del font renderizzato con se stesso (anteprima).
 
@@ -157,7 +168,8 @@ if not Font._fonts_menu_getface_patch then
     logger.info("fonts-menu-patch: Font:getFace patchato (FontFaceObj pass-through)")
 end
 
--- Header fisso in alto: "Fonts" a sinistra, "Close" a destra (inglese).
+-- Header fisso in alto: titolo a sinistra, "Close" a destra (tradotti con
+-- gettext → nella lingua impostata sul dispositivo).
 -- Va reinserito dopo ogni reinit() del ButtonDialog.
 -- Altezza = altezza del TextBoxWidget originale del titolo, così
 -- title_group_height / top_to_content_offset / max_height calcolati
@@ -178,24 +190,14 @@ local function applyFontsHeader(dialog)
     end
 
     local fonts_label = TextWidget:new{
-        text = "Fonts",
+        text = _("Font"), -- stesso msgid della riga nel ConfigDialog
         face = Font:getFace("infofont"),
     }
     local natural_h = fonts_label:getSize().h
     local h = target_h or natural_h
 
-    -- Centra verticalmente "Fonts" se l'header è più alto del label;
-    -- LeftContainer allinea a sinistra (CenterContainer lo sposterebbe al centro)
-    local label_widget = fonts_label
-    if h > natural_h then
-        label_widget = LeftContainer:new{
-            dimen = Geom:new{ w = width, h = h },
-            fonts_label,
-        }
-    end
-
     local close_btn = Button:new{
-        text = "Close", -- solo testo inglese, non tradotto
+        text = _("Close"),
         bordersize = 0,
         margin = 0,
         padding = 0,
@@ -214,6 +216,24 @@ local function applyFontsHeader(dialog)
         end,
     }
     close_btn.overlap_align = "right"
+
+    -- Su schermi stretti il pulsante Close (es. de "Schließen") può sforare:
+    -- il titolo viene troncato con "…" invece di finirci sotto.
+    -- Guard su spazio non positivo (niente max_width negativo).
+    local label_max_width = width - close_btn:getSize().w - Size.padding.default
+    if label_max_width > 0 then
+        fonts_label:setMaxWidth(label_max_width)
+    end
+
+    -- Centra verticalmente il titolo se l'header è più alto del label;
+    -- LeftContainer allinea a sinistra (CenterContainer lo sposterebbe al centro)
+    local label_widget = fonts_label
+    if h > natural_h then
+        label_widget = LeftContainer:new{
+            dimen = Geom:new{ w = width, h = h },
+            fonts_label,
+        }
+    end
 
     local header = OverlapGroup:new{
         dimen = Geom:new{ w = width, h = h },
@@ -333,7 +353,7 @@ if not ReaderFont.onShowFontFaceMenu then
             end
 
             dialog = ButtonDialog:new{
-                title = "Fonts", -- placeholder: sostituito da applyFontsHeader
+                title = _("Font"), -- placeholder: sostituito da applyFontsHeader
                 buttons = buttons, -- solo font + scroll; Close è nell'header
                 rows_per_page = 6,
                 width_factor = 0.8,

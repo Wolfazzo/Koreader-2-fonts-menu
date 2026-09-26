@@ -5,6 +5,10 @@
 -- Tap su un font → applica subito; "Close" → chiude solo la modale.
 -- Solo documenti CRE (EPUB/TXT/...): i PDF usano KoptOptions e non
 -- vengono toccati.
+-- La scorciatoia "Font" è disegnata con il font attivo del documento:
+-- testo "CARATTERE: Lora" (etichetta tradotta in MAIUSCOLO + ":" + nome
+-- originale del font), senza sottolineatura, e si aggiorna non appena si
+-- sceglie un altro font nel modale.
 
 local CreOptions = require("ui/data/creoptions")
 local ReaderFont = require("apps/reader/modules/readerfont")
@@ -15,6 +19,9 @@ local Button = require("ui/widget/button")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local TextWidget = require("ui/widget/textwidget")
 local Font = require("ui/font")
+-- Maiuscole UTF-8 per l'etichetta della scorciatoia (utf8proc):
+-- gestisce gli accenti delle traduzioni, a differenza di string.upper.
+local Utf8Proc = require("ffi/utf8proc")
 local Geom = require("ui/geometry")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -25,6 +32,16 @@ local logger = require("logger")
 local _ = require("gettext")
 
 local SHORTCUT_NAME = "font_face_shortcut"
+-- Etichetta tradotta e messa in maiuscolo, con i due punti:
+--   it_IT → "CARATTERE:"   en → "FONT:"
+-- Calcolata una volta sola a caricamento (dopo l'applicazione della lingua),
+-- fuori dai loop dove la variabile `_` di gettext verrebbe oscurata.
+local SHORTCUT_LABEL = _("Font")
+local SHORTCUT_LABEL_UPPER = Utf8Proc.uppercase_dumb(SHORTCUT_LABEL) .. ":"
+-- Stessa size della riga nel ConfigDialog (item_font_size): il FontFaceObj
+-- del font attivo viene creato a questa size → pass-through in Font:getFace.
+local SHORTCUT_PREVIEW_SIZE = 20
+local shortcut_option = nil -- opzione iniettata (tabella condivisa in CreOptions)
 local active_font_dialog = nil
 
 -- ─── 1. Iniezione opzione nel pannello Dimensione font (solo CreOptions) ───
@@ -33,15 +50,14 @@ local active_font_dialog = nil
 -- esistenti per evitare di corrompere array condivisi.
 
 local function injectShortcutOption()
-    -- Traduzione calcolata FUORI dai loop: in `for _, ...` la variabile
-    -- locale `_` del loop oscura quella di gettext e `_(...)` esploderebbe
-    -- con "attempt to call local '_' (a number value)".
-    local shortcut_label = _("Font")
+    -- NOTA: l'etichetta è già in SHORTCUT_LABEL (calcolata a livello modulo):
+    -- qui `for _, ...` oscurerebbe la `_` di gettext.
     for _, panel in ipairs(CreOptions) do
         if panel.icon == "appbar.textsize" and type(panel.options) == "table" then
             -- Guard: già iniettata?
             for _, opt in ipairs(panel.options) do
                 if opt.name == SHORTCUT_NAME then
+                    shortcut_option = opt
                     return true
                 end
             end
@@ -50,23 +66,28 @@ local function injectShortcutOption()
             local insert_at = 1
 
             -- values omesso → niente ConfigChange, niente salvataggio in configurable.
-            -- current_func restituisce sempre 0 = args[1]: ConfigDialog imposta
-            -- current_item = 1 ad ogni ridisegno → sottolineatura nera permanente sulla riga.
-            -- args = {0} è necessario sia per current_func sia per onMakeDefault.
-            table.insert(panel.options, insert_at, {
+            -- current_func restituisce sempre 0 = args[1] → current_item = 1, come
+            -- prima: è solo lo stato "selezionato" (nessuna linea viene disegnata,
+            -- vedi postProcessShortcutRow). args = {0} serve a current_func e a
+            -- onMakeDefault (hold).
+            local shortcut = {
                 name = SHORTCUT_NAME,
                 -- name_text omesso: solo l'etichetta, senza label a sinistra.
-                -- shortcut_label = _("Font"), msgid già nei cataloghi KOReader
-                -- → tradotta in tutte le lingue (it "Carattere", fr "Police", ...).
-                item_text = { shortcut_label },
+                -- Solo placeholder: l'hook di update riscrive item_text in
+                -- "CARATTERE: Lora" (etichetta tradotta in maiuscolo + nome font).
+                item_text = { SHORTCUT_LABEL_UPPER },
                 item_align_center = 1.0,
-                item_font_size = 20,
+                item_font_size = SHORTCUT_PREVIEW_SIZE,
                 height = 18, -- riga più stretta: meno spazio vuoto sopra/sotto la scorciatoia
                 spacing = 15,
                 args = { 0 },
-                current_func = function() return 0 end, -- forza sottolineatura sempre visibile
+                current_func = function() return 0 end, -- current_item = 1 (invariato)
                 event = "ShowFontFaceMenu",
-            })
+            }
+            -- Riferimento per item_font_face (font attivo del documento):
+            -- aggiornato a ogni ConfigDialog:update, prima del build.
+            shortcut_option = shortcut
+            table.insert(panel.options, insert_at, shortcut)
             logger.info("fonts-menu-patch: scorciatoia font inserita prima di font_size (sottolineata)")
             return true
         end
@@ -74,35 +95,113 @@ local function injectShortcutOption()
     logger.warn("fonts-menu-patch: pannello appbar.textsize non trovato in CreOptions")
     return false
 end
-
 injectShortcutOption()
 
--- ─── 1b. Allineamento scorciatoia al bordo sinistro del pannello ───────────
--- ConfigDialog usa CenterContainer per gli item → la riga finisce al centro.
--- Dopo ogni update() sostituiamo il container della riga con LeftContainer
--- (stessa dimen → nessun resize, solo diverso paint).
+-- ─── 1b. Font attivo del documento per la scorciatoia ──────────────────────
+-- La riga "Font" nel ConfigDialog viene disegnata con lo stesso font del
+-- documento, così a colpo d'occhio si vede quale carattere è attivo.
+-- Risoluzione identica a quella delle righe del modale: prima si prova la
+-- font_func della face_table (stesso filename/faceindex già calcolati da
+-- ReaderFont), poi la risoluzione diretta crengine, infine nil → "cfont".
 
-local function leftAlignShortcutRow(config_panel)
+local function activeDocFontFace(reader_font, size)
+    if not reader_font or not reader_font.font_face then
+        return nil
+    end
+    local face_name = reader_font.font_face
+
+    -- 1) Stessa sorgente delle righe del modale (item della face_table)
+    local face_table = reader_font.face_table
+    if face_table then
+        for _, item in ipairs(face_table) do
+            if item.menu_item_id == face_name then
+                -- nil se l'anteprima con il font è disattivata in lettura
+                local face = item.font_func and item.font_func(size)
+                if face then return face end
+                break
+            end
+        end
+    end
+
+    -- 2) Fallback: filename + faceindex direttamente da crengine
+    local cre = require("document/credocument"):engineInit()
+    local font_filename, font_faceindex = cre.getFontFaceFilenameAndFaceIndex(face_name)
+    if not font_filename then
+        -- Solo italico/cursive: stesso tentativo fatto da ReaderFont
+        font_filename, font_faceindex = cre.getFontFaceFilenameAndFaceIndex(face_name, nil, true)
+    end
+    if font_filename then
+        return Font:getFace(font_filename, size, font_faceindex)
+    end
+
+    -- 3) Font non risolvibile (o getFace fallito) → nil: niente item_font_face
+    --    → ConfigDialog usa "cfont" come prima della patch.
+    return nil
+end
+
+-- Testo della scorciatoia: "CARATTERE: Lora" (o "FONT: Lora" in inglese).
+-- Etichetta tradotta in maiuscolo + ":" + nome ORIGINALE del font attivo
+-- (reader_font.font_face, stessa sorgente della voce di menù "Font: %1").
+-- Testo e stile arrivano dallo stesso TextWidget → tutto in stile del font.
+local function shortcutLabelText(reader_font)
+    local face_name = reader_font and reader_font.font_face
+    if face_name and face_name ~= "" then
+        return SHORTCUT_LABEL_UPPER .. " " .. face_name
+    end
+    -- Nome non disponibile (caso di fatto irraggiungibile): solo l'etichetta
+    return SHORTCUT_LABEL_UPPER
+end
+
+-- Aggiorna la scorciatoia "Font" nel ConfigDialog sottostante dopo un cambio
+-- font dal modale: stessa coppia update + setDirty di ConfigDialog:onConfigChoose.
+local function refreshShortcutFontRow(reader_font)
+    local reader_config = reader_font and reader_font.ui and reader_font.ui.config
+    local config_dialog = reader_config and reader_config.config_dialog
+    if not config_dialog or not config_dialog.dialog_frame then return end
+    -- Difesa da un riferimento rimasto indietro dopo una chiusura non pulita
+    if not UIManager:isSubwidgetShown(config_dialog) then return end
+    config_dialog:update()
+    UIManager:setDirty(config_dialog, function()
+        return "ui", config_dialog.dialog_frame.dimen
+    end)
+end
+
+
+-- ─── 1c. Post-processo della riga scorciatoia (dopo ogni update) ────────────
+-- 1) niente sottolineatura (linesize = 0, altezza contenitore invariata)
+-- 2) ConfigDialog usa CenterContainer per gli item → la riga finisce al centro:
+--    sostituiamo il container con LeftContainer (stessa dimen → solo paint).
+
+local function postProcessShortcutRow(config_panel)
     local config_option = config_panel and config_panel[1]
     local vertical_group = config_option and config_option[1]
     if not vertical_group then return end
 
     for _, horizontal_group in ipairs(vertical_group) do
-        -- Cerca la riga che contiene il nostro item
-        local found = false
+        -- Cerca la riga che contiene il nostro item (l'OptionTextItem)
+        local found_widget = nil
         local function findShortcut(w)
-            if found or type(w) ~= "table" then return end
+            if found_widget or type(w) ~= "table" then return end
             if w.name == SHORTCUT_NAME then
-                found = true
+                found_widget = w
                 return
             end
             for _, child in ipairs(w) do
                 findShortcut(child)
-                if found then return end
+                if found_widget then return end
             end
         end
         findShortcut(horizontal_group)
-        if not found then goto continue end
+        if not found_widget then goto continue end
+
+        -- Rimuove la sottolineatura: compensando il padding con linesize/2
+        -- getSize() resta identico (content.h + 2p + L), mentre
+        -- paintRect(h = 0) non disegna nulla → niente linea sui descrittori.
+        local underline = found_widget.underline_container
+        if underline and underline.linesize ~= 0 then
+            underline.padding = underline.padding + underline.linesize / 2
+            underline.linesize = 0
+        end
 
         -- Senza name_text: horizontal_group[1] è il CenterContainer della riga
         local center = horizontal_group[1]
@@ -128,13 +227,24 @@ end
 if not ConfigDialog._fonts_menu_patch then
     local raw_update = ConfigDialog.update
     function ConfigDialog:update()
+        -- Font attivo del documento per la scorciatoia "Font": stile e testo
+        -- ("CARATTERE: Lora") vanno assegnati PRIMA del build, perché
+        -- ConfigOption:init legge item_font_face/item_text durante l'update
+        -- (FontFaceObj a size 20 → pass-through in Font:getFace).
+        -- Solo i pannelli CRE: con KoptOptions (PDF) la scorciatoia non c'è.
+        if shortcut_option and self.config_options == CreOptions then
+            local reader_font = self.ui and self.ui.font
+            shortcut_option.item_font_face = activeDocFontFace(reader_font,
+                SHORTCUT_PREVIEW_SIZE)
+            shortcut_option.item_text = { shortcutLabelText(reader_font) }
+        end
         raw_update(self)
         if self.config_panel then
-            leftAlignShortcutRow(self.config_panel)
+            postProcessShortcutRow(self.config_panel)
         end
     end
     ConfigDialog._fonts_menu_patch = true
-    logger.info("fonts-menu-patch: hook ConfigDialog:update installato (scorciatoia left-align)")
+    logger.info("fonts-menu-patch: hook ConfigDialog:update installato (font attivo, no sottolineatura, left-align)")
 end
 
 -- ─── 2. Modale font sopra il ConfigDialog ──────────────────────────────────
@@ -247,6 +357,9 @@ end
 
 if not ReaderFont.onShowFontFaceMenu then
     function ReaderFont:onShowFontFaceMenu()
+        -- Catturato qui: dentro i callback serve per aggiornare la riga
+        -- "Font" del ConfigDialog con il font appena scelto.
+        local reader_font = self
         -- Deferred: lascia finire onConfigChoose (update + repaint del
         -- ConfigDialog) prima di sovrapporre la modale.
         UIManager:nextTick(function()
@@ -345,6 +458,9 @@ if not ReaderFont.onShowFontFaceMenu then
                             end
                             UIManager:setDirty(dialog, "ui")
                         end
+                        -- La scorciatoia "Font" nel ConfigDialog sottostante
+                        -- deve mostrare subito il nuovo carattere attivo
+                        refreshShortcutFontRow(reader_font)
                     end,
                     hold_callback = item.hold_callback and function()
                         item.hold_callback(nil) -- makeDefault (senza TouchMenu)

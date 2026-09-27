@@ -22,6 +22,6 @@ Testing on Kindle pw 11 gen and koreader on linux
 
 <img width="623" height="822" alt="lista fonts fissa" src="https://github.com/user-attachments/assets/21ce8945-6721-4094-9b0a-cdb00216b9d5" />
 
-2-fonts-menu-alternative.lua
+**2-fonts-menu-alternative.lua**
 
 

@@ -18,5 +18,10 @@ Testing on Kindle pw 11 gen and koreader on linux
 
 <img width="619" height="797" alt="modale" src="https://github.com/user-attachments/assets/d9c28d66-5773-40b2-9d5e-f48103e2e6f1" />
 
+**2-fonts-menu**
+
+<img width="623" height="822" alt="lista fonts fissa" src="https://github.com/user-attachments/assets/21ce8945-6721-4094-9b0a-cdb00216b9d5" />
+
+2-fonts-menu-alternative.lua
 
 

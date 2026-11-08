@@ -1,3 +1,4 @@
+-- Variante grafica: attivare al posto delle altre versioni fonts-menu.
 -- Patch unificata: scorciatoia "Font" nel ConfigDialog (pannello Dimensione font)
 -- Un tap sulla scorciatoia apre una modale ButtonDialog con l'elenco dei font
 -- (stessa sorgente del menù: face_table / cre.getFontFaces).
@@ -30,6 +31,7 @@ local UIManager = require("ui/uimanager")
 local ConfigDialog = require("ui/widget/configdialog")
 local ButtonDialog = require("ui/widget/buttondialog")
 local Button = require("ui/widget/button")
+local Blitbuffer = require("ffi/blitbuffer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local TextWidget = require("ui/widget/textwidget")
 local Font = require("ui/font")
@@ -327,7 +329,7 @@ local function injectShortcutOption()
                 item_text = { SHORTCUT_LABEL_UPPER },
                 item_align_center = 1.0,
                 item_font_size = SHORTCUT_PREVIEW_SIZE,
-                height = 18, -- riga più stretta: meno spazio vuoto sopra/sotto la scorciatoia
+                height = 40, -- spazio per due comandi ben distinguibili
                 spacing = 15,
                 args = { 0 },
                 current_func = function() return 0 end, -- current_item = 1 (invariato)
@@ -395,7 +397,7 @@ end
 local function shortcutLabelText(reader_font)
     local face_name = reader_font and reader_font.font_face
     if face_name and face_name ~= "" then
-        return SHORTCUT_LABEL_UPPER .. " " .. face_name
+        return SHORTCUT_LABEL .. ": " .. face_name
     end
     -- Nome non disponibile (caso di fatto irraggiungibile): solo l'etichetta
     return SHORTCUT_LABEL_UPPER
@@ -429,6 +431,61 @@ end
 --    senso): l'override è sull'istanza dell'OptionTextItem (il dispatch usa
 --    self[event.handler], vedi eventlistener.lua), flag per non ripeterlo.
 
+-- Misura i glifi rispetto alla baseline originale. Le due stringhe devono
+-- condividere UNA baseline: centrarle separatamente sposta parole con accenti
+-- o discendenti rispetto a parole che non li contengono.
+local function measureVisibleText(label)
+    local size = label:getSize()
+    if size.w <= 0 or size.h <= 0 then return end
+    local baseline = label.forced_baseline or label:getBaseline()
+    local margin = math.ceil(math.max(size.h, Screen:scaleBySize(10)))
+    local width = math.ceil(size.w + 2 * margin)
+    local height = math.ceil(size.h + 2 * margin)
+    local bb = Blitbuffer.new(width, height, Blitbuffer.TYPE_BB8)
+    local ok, top, bottom = pcall(function()
+        bb:fill(Blitbuffer.COLOR_WHITE)
+        label:paintTo(bb, margin, margin)
+        local function rowHasInk(y)
+            for x = 0, width - 1 do
+                if bb:getPixel(x, y):getColor8().a < 240 then return true end
+            end
+            return false
+        end
+        local first, last
+        for y = 0, height - 1 do
+            if rowHasInk(y) then first = y; break end
+        end
+        if not first then return end
+        for y = height - 1, first, -1 do
+            if rowHasInk(y) then last = y; break end
+        end
+        return first - margin - baseline, last + 1 - margin - baseline
+    end)
+    bb:free()
+    if ok then return top, bottom end
+    logger.warn("fonts-menu-integrato: impossibile misurare il testo", top)
+end
+
+local function alignButtonLabels(font_label, profiles_label, inner_height)
+    local top1, bottom1 = measureVisibleText(font_label)
+    local top2, bottom2 = measureVisibleText(profiles_label)
+    local baseline
+    if top1 and top2 then
+        local top = math.min(top1, top2)
+        local bottom = math.max(bottom1, bottom2)
+        baseline = math.floor((inner_height - (bottom - top)) / 2 - top + 0.5)
+    else
+        -- Se la misura non è disponibile, resta comunque una baseline comune.
+        baseline = math.floor((inner_height - font_label:getSize().h) / 2)
+            + font_label:getBaseline()
+    end
+    for _, label in ipairs({ font_label, profiles_label }) do
+        label.forced_height = inner_height
+        label.forced_baseline = baseline -- rendering XText
+        label._baseline_h = baseline -- rendering senza XText
+    end
+end
+
 local function postProcessShortcutRow(config_panel, reader_font)
     local config_option = config_panel and config_panel[1]
     local vertical_group = config_option and config_option[1]
@@ -460,12 +517,12 @@ local function postProcessShortcutRow(config_panel, reader_font)
             found_widget.__fonts_menu_hold = true
         end
 
-        -- Rimuove la sottolineatura: compensando il padding con linesize/2
-        -- getSize() resta identico (content.h + 2p + L), mentre
-        -- paintRect(h = 0) non disegna nulla → niente linea sui descrittori.
+        -- Elimina la sottolineatura e il suo padding negativo: la dimensione
+        -- del contenitore coincide così con quella del testo e il centraggio
+        -- verticale usa le stesse metriche del pulsante Profili.
         local underline = found_widget.underline_container
-        if underline and underline.linesize ~= 0 then
-            underline.padding = underline.padding + underline.linesize / 2
+        if underline then
+            underline.padding = 0
             underline.linesize = 0
         end
 
@@ -475,65 +532,68 @@ local function postProcessShortcutRow(config_panel, reader_font)
         -- Già applicato?
         if center.__fonts_menu_left then goto continue end
 
-        -- Altezza/larghezza della riga: h serve per l'offset verticale del
-        -- pulsante, w per posizionarlo a destra (stessa x di overlap_align).
-        local h = center.dimen.h
-        local w = center.dimen.w
+        -- Due controlli affiancati, con lo stesso bordo arrotondato delle
+        -- altre impostazioni. Il primo conserva l'OptionTextItem originale:
+        -- tap, pressione prolungata e gestione del focus restano invariati.
+        local h, w = center.dimen.h, center.dimen.w
+        local inset = Size.padding.fullscreen
+        local gap = Size.padding.default
+        local border = Size.border.thin
+        local vertical_inset = Size.padding.small
+        local control_h = math.max(1, h - 2 * vertical_inset)
+        local radius = math.min(Screen:scaleBySize(12), math.floor(control_h / 2))
+        local available = math.max(1, w - 2 * inset - gap)
+        local profiles_width = math.floor(available * 0.30)
+        local font_width = available - profiles_width
+        local font_padding = Size.padding.large
 
-        -- Testo PROFILI cliccabile a destra (senza bordo, sembra testo normale).
-        -- Allineamento verticale PERFETTO con il label: LeftContainer centra
-        -- il GRUPPO (group_h = text_h + linesize + 2*padding, con padding
-        -- NEGATIVO della sottolineatura → group_h < text_h), mentre il testo
-        -- sta in CIMA al gruppo (UnderlineContainer vertical_align = "top"):
-        --   top_label = floor((h - group_h)/2)   (LeftContainer:paintTo)
-        -- Un pulsante con height = h centrerebbe il solo testo in h → scarto
-        -- di pochi pixel. Usiamo invece altezza NATURALE (= altezza del
-        -- testo: padding_v = 0, bordo 0 → top del testo = top del pulsante)
-        -- e overlap_offset con l'identica formula → allineamento al pixel,
-        -- qualunque siano group_h, font, scale o lingua.
-        local found_reader_font = reader_font -- cattura per la closure
-        -- Font del documento attivo: STESSA FontFaceObj usata dal label
-        -- "CARATTERE: nome" (item_font_face = activeDocFontFace →
-        -- Font:getFace pass-through a size invariata), così il testo è
-        -- omogeneo a sinistra e a destra. Fallback "cfont": è il font con
-        -- cui ConfigDialog disegna il label quando item_font_face è nil.
-        local profiles_face = activeDocFontFace(reader_font, SHORTCUT_PREVIEW_SIZE)
+        -- Il nome può essere molto lungo: troncarlo entro il primo controllo
+        -- evita che il testo invada il pulsante dei profili.
+        local label = found_widget.underline_container[1]
+        label:setMaxWidth(math.max(1, font_width - 2 * (border + font_padding)))
         local profiles_btn = Button:new{
-            text = PROFILES_LABEL_UPPER,
-            bordersize = 0,
-            margin = 0,
-            padding = 0,
-            padding_h = Size.padding.fullscreen, -- distanza dal bordo destro
-            -- niente height: altezza naturale del frame = altezza del testo
-            text_font_face = profiles_face or "cfont",
-            text_font_size = SHORTCUT_PREVIEW_SIZE, -- stessa size del label font
+            text = PROFILES_LABEL,
+            width = profiles_width,
+            height = math.max(1, control_h - 2 * border),
+            bordersize = border,
+            radius = radius,
+            margin = 0, padding = 0,
+            padding_h = Size.padding.button, padding_v = 0,
+            text_font_face = label.face, -- stesso oggetto font del primo pulsante
+            text_font_size = SHORTCUT_PREVIEW_SIZE,
             text_font_bold = false,
-            callback = function()
-                showProfilesList(found_reader_font)
-            end,
+            avoid_text_truncation = false,
+            callback = function() showProfilesList(reader_font) end,
         }
-        -- x = w - btn_w (equivale a overlap_align = "right").
-        -- y = stessa formula verticale di LeftContainer:paintTo applicata
-        -- all'option_items_group (center[1], child del LeftContainer).
-        profiles_btn.overlap_offset = {
-            w - profiles_btn:getSize().w,
-            math.floor((h - center[1]:getSize().h) / 2),
+        alignButtonLabels(label, profiles_btn.label_widget, math.max(1, control_h - 2 * border))
+        local item_size = found_widget[1]:getSize()
+        found_widget.dimen.w = math.max(item_size.w, font_width - 2 * border - font_padding)
+        found_widget.dimen.h = item_size.h
+        if center[1].resetLayout then center[1]:resetLayout() end
+
+        local font_box = FrameContainer:new{
+            bordersize = border,
+            radius = radius,
+            color = Blitbuffer.COLOR_DARK_GRAY,
+            background = Blitbuffer.COLOR_LIGHT_GRAY,
+            padding = 0,
+            LeftContainer:new{
+                dimen = Geom:new{ w = math.max(1, font_width - 2 * border),
+                    h = math.max(1, control_h - 2 * border) },
+                FrameContainer:new{
+                    bordersize = 0, padding = 0, padding_left = font_padding,
+                    center[1],
+                },
+            },
         }
+        font_box.overlap_offset = { inset, vertical_inset }
+        profiles_btn.frame.color = Blitbuffer.COLOR_DARK_GRAY
+        profiles_btn.frame.background = Blitbuffer.COLOR_LIGHT_GRAY
+        profiles_btn.overlap_offset = { inset + font_width + gap, vertical_inset }
 
         horizontal_group[1] = OverlapGroup:new{
             dimen = Geom:new{ w = w, h = h },
-            -- Sinistra: label font (LeftContainer centra verticalmente,
-            -- padding_left simmetrico al padding_h del pulsante)
-            LeftContainer:new{
-                dimen = Geom:new{ w = w, h = h },
-                FrameContainer:new{
-                    padding = 0,
-                    padding_left = Size.padding.fullscreen,
-                    bordersize = 0,
-                    center[1], -- option_items_group
-                },
-            },
-            -- Destra: testo PROFILI (cliccabile, senza bordo)
+            font_box,
             profiles_btn,
         }
         horizontal_group[1].__fonts_menu_left = true

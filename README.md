@@ -26,6 +26,12 @@ Note: The profile tab shows existing profiles. If you create a new one, you’ll
 
 Testing on Kindle pw 11 gen and koreader on linux
 
+NEW UPDATE: BUTTON FOR BETTER LAYOUT.
+
+<img width="456" height="835" alt="ksnip_20261108-203633" src="https://github.com/user-attachments/assets/f9e7bc01-47f6-4e19-b749-9f111dd1488c" />
+
+________________________________
+
 <img width="692" height="822" alt="ksnip_20260929-171415" src="https://github.com/user-attachments/assets/1d64d463-3741-432e-a132-eb85ed01fa19" />
 
 <img width="619" height="797" alt="modale" src="https://github.com/user-attachments/assets/d9c28d66-5773-40b2-9d5e-f48103e2e6f1" />
